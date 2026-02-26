@@ -28,6 +28,7 @@ from . import (
 )
 from .securitas_direct_new_api import (
     ArmStatus,
+    ArmWithOpenSensorsError,
     CheckAlarmStatus,
     DisarmStatus,
     Installation,
@@ -306,6 +307,24 @@ class SecuritasAlarm(alarm.AlarmControlPanelEntity):
         try:
             arm_status = await self.client.session.arm_alarm(
                 self.installation, command
+            )
+        except ArmWithOpenSensorsError as exc:
+            _LOGGER.warning(
+                "Open sensors detected (%d exception(s)), forcing arm",
+                exc.exceptions_number,
+            )
+            try:
+                arm_status = await self.client.session.arm_alarm_forced(
+                    self.installation, command, exc.exceptions_number
+                )
+            except SecuritasDirectError as err:
+                _LOGGER.error("Failed to force arm: %s", err.args)
+                return
+            self._notify_error(
+                "open_sensors_forced_arm",
+                "Securitas: Armed with open sensors",
+                f"The alarm was armed despite **{exc.exceptions_number}** open "
+                f"sensor(s). Please verify all sensors are secure.",
             )
         except SecuritasDirectError as err:
             _LOGGER.error(err.args)

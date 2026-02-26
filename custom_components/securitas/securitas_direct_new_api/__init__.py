@@ -26,6 +26,6 @@ from .dataTypes import (  # noqa: F401
     SmartLockModeStatus,
 )
 from .domains import ApiDomains  # noqa: F401
-from .exceptions import Login2FAError, LoginError, SecuritasDirectError  # noqa: F401
+from .exceptions import ArmWithOpenSensorsError, Login2FAError, LoginError, SecuritasDirectError  # noqa: F401
 
 _LOGGER = logging.getLogger(__name__)

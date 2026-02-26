@@ -28,7 +28,7 @@ from .dataTypes import (
     SmartLockModeStatus,
 )
 from .domains import ApiDomains
-from .exceptions import Login2FAError, LoginError, SecuritasDirectError
+from .exceptions import ArmWithOpenSensorsError, Login2FAError, LoginError, SecuritasDirectError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -682,7 +682,62 @@ class ApiManager:
             )
             count += 1
 
-        self.protom_response = raw_data["protomResponse"]
+        error = raw_data.get("error")
+        if error and error.get("allowForcing"):
+            raise ArmWithOpenSensorsError(
+                f"Open sensors detected ({error.get('exceptionsNumber', 0)} exception(s))",
+                error.get("exceptionsNumber", 0),
+                error.get("referenceId", ""),
+            )
+
+        if raw_data.get("protomResponse"):
+            self.protom_response = raw_data["protomResponse"]
+        return ArmStatus(
+            raw_data["res"],
+            raw_data["msg"],
+            raw_data["status"],
+            raw_data["numinst"],
+            raw_data["protomResponse"],
+            raw_data["protomResponseDate"],
+            raw_data["requestId"],
+            raw_data["error"],
+        )
+
+    async def arm_alarm_forced(
+        self, installation: Installation, command: str, exceptions_number: int
+    ) -> ArmStatus:
+        """Arms the alarm forcefully, acknowledging open-sensor exceptions."""
+        content = {
+            "operationName": "xSArmPanel",
+            "variables": {
+                "request": command,
+                "numinst": installation.number,
+                "panel": installation.panel,
+                "currentStatus": self.protom_response,
+                "exceptions": exceptions_number,
+            },
+            "query": "mutation xSArmPanel($numinst: String!, $request: ArmCodeRequest!, $panel: String!, $currentStatus: String, $exceptions: Int) {\n  xSArmPanel(numinst: $numinst, request: $request, panel: $panel, currentStatus: $currentStatus, exceptions: $exceptions) {\n    res\n    msg\n    referenceId\n  }\n}\n",
+        }
+        await self._check_authentication_token()
+        await self._check_capabilities_token(installation)
+        response = await self._execute_request(content, "xSArmPanel", installation)
+        response = response["data"]["xSArmPanel"]
+        if response["res"] != "OK":
+            raise SecuritasDirectError(response["msg"], response)
+
+        reference_id = response["referenceId"]
+
+        count = 1
+        raw_data: dict[str, Any] = {}
+        while (count == 1) or (raw_data.get("res") == "WAIT"):
+            await asyncio.sleep(self.delay_check_operation)
+            raw_data = await self._check_arm_status(
+                installation, reference_id, command, count
+            )
+            count += 1
+
+        if raw_data.get("protomResponse"):
+            self.protom_response = raw_data["protomResponse"]
         return ArmStatus(
             raw_data["res"],
             raw_data["msg"],

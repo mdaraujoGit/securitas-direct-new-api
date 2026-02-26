@@ -23,3 +23,14 @@ class TokenRefreshError(LoginError):
 
 class Login2FAError(LoginError):
     """Exception raised when a 2FA authentication is needed."""
+
+
+class ArmWithOpenSensorsError(SecuritasDirectError):
+    """Raised when arming is blocked by open sensors but forcing is allowed."""
+
+    def __init__(
+        self, message: str, exceptions_number: int, exceptions_reference_id: str
+    ) -> None:
+        super().__init__(message)
+        self.exceptions_number = exceptions_number
+        self.exceptions_reference_id = exceptions_reference_id
