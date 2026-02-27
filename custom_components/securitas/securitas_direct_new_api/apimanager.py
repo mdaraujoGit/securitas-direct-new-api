@@ -704,7 +704,11 @@ class ApiManager:
         )
 
     async def arm_alarm_forced(
-        self, installation: Installation, command: str, exceptions_number: int
+        self,
+        installation: Installation,
+        command: str,
+        exceptions_number: int,
+        exceptions_reference_id: str = "",
     ) -> ArmStatus:
         """Arms the alarm forcefully, acknowledging open-sensor exceptions."""
         content = {
@@ -714,9 +718,10 @@ class ApiManager:
                 "numinst": installation.number,
                 "panel": installation.panel,
                 "currentStatus": self.protom_response,
-                "exceptions": exceptions_number,
+                "exceptionsNumber": exceptions_number,
+                "referenceId": exceptions_reference_id,
             },
-            "query": "mutation xSArmPanel($numinst: String!, $request: ArmCodeRequest!, $panel: String!, $currentStatus: String, $exceptions: Int) {\n  xSArmPanel(numinst: $numinst, request: $request, panel: $panel, currentStatus: $currentStatus, exceptions: $exceptions) {\n    res\n    msg\n    referenceId\n  }\n}\n",
+            "query": "mutation xSArmPanel($numinst: String!, $request: ArmCodeRequest!, $panel: String!, $currentStatus: String, $exceptionsNumber: Int, $referenceId: String) {\n  xSArmPanel(numinst: $numinst, request: $request, panel: $panel, currentStatus: $currentStatus, exceptionsNumber: $exceptionsNumber, referenceId: $referenceId) {\n    res\n    msg\n    referenceId\n  }\n}\n",
         }
         await self._check_authentication_token()
         await self._check_capabilities_token(installation)

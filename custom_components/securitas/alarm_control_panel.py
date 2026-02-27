@@ -315,7 +315,10 @@ class SecuritasAlarm(alarm.AlarmControlPanelEntity):
             )
             try:
                 arm_status = await self.client.session.arm_alarm_forced(
-                    self.installation, command, exc.exceptions_number
+                    self.installation,
+                    command,
+                    exc.exceptions_number,
+                    exc.exceptions_reference_id,
                 )
             except SecuritasDirectError as err:
                 _LOGGER.error("Failed to force arm: %s", err.args)
