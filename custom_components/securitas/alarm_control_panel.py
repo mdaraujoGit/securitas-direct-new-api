@@ -310,25 +310,16 @@ class SecuritasAlarm(alarm.AlarmControlPanelEntity):
             )
         except ArmWithOpenSensorsError as exc:
             _LOGGER.warning(
-                "Open sensors detected (%d exception(s)), forcing arm",
+                "Arm blocked: %d open sensor(s) detected",
                 exc.exceptions_number,
             )
-            try:
-                arm_status = await self.client.session.arm_alarm_forced(
-                    self.installation,
-                    command,
-                    exc.exceptions_number,
-                    exc.exceptions_reference_id,
-                )
-            except SecuritasDirectError as err:
-                _LOGGER.error("Failed to force arm: %s", err.args)
-                return
             self._notify_error(
-                "open_sensors_forced_arm",
-                "Securitas: Armed with open sensors",
-                f"The alarm was armed despite **{exc.exceptions_number}** open "
-                f"sensor(s). Please verify all sensors are secure.",
+                "open_sensors_arm_blocked",
+                "Securitas: Arm blocked — open sensors",
+                f"The alarm could not be armed because **{exc.exceptions_number}** "
+                f"sensor(s) are open. Please secure all sensors and try again.",
             )
+            return
         except SecuritasDirectError as err:
             _LOGGER.error(err.args)
             return
