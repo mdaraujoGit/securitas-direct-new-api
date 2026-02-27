@@ -797,33 +797,76 @@ class ApiManager:
         if "res" in response and response["res"] != "OK":
             raise SecuritasDirectError(response["msg"], response)
 
-        if "referenceId" not in response or "res" not in response:
-            raise SecuritasDirectError("No referenceId in response", response)
+        # Treat a missing or empty referenceId the same way: skip status polling.
+        # Some panels (e.g. Portugal) return res=OK but an empty referenceId,
+        # which causes every xSDisarmStatus call to respond with
+        # error_no_response_to_request — wasting 30 s and yielding no result.
+        reference_id = response.get("referenceId") or ""
 
-        reference_id = response["referenceId"]
-
-        count = 1
         raw_data: dict[str, Any] = {}
-        max_retries = max(10, round(30 / max(1, self.delay_check_operation)))
-        while (count == 1) or (
-            raw_data.get("res") == "WAIT"
-            or raw_data.get("msg") == "alarm-manager.error_no_response_to_request"
-        ):
-            if count > max_retries:
-                _LOGGER.warning(
-                    "Disarm status check exceeded max retries (%d), last response: %s",
-                    max_retries,
-                    raw_data,
+        if reference_id:
+            count = 1
+            max_retries = max(10, round(30 / max(1, self.delay_check_operation)))
+            while (count == 1) or (
+                raw_data.get("res") == "WAIT"
+                or raw_data.get("msg") == "alarm-manager.error_no_response_to_request"
+            ):
+                if count > max_retries:
+                    _LOGGER.warning(
+                        "Disarm status check exceeded max retries (%d), last response: %s",
+                        max_retries,
+                        raw_data,
+                    )
+                    break
+                await asyncio.sleep(self.delay_check_operation)
+                raw_data = await self._check_disarm_status(
+                    installation,
+                    reference_id,
+                    command,
+                    count,
                 )
-                break
-            await asyncio.sleep(self.delay_check_operation)
-            raw_data = await self._check_disarm_status(
-                installation,
-                reference_id,
-                command,
-                count,
+                count += 1
+        else:
+            _LOGGER.warning(
+                "xSDisarmPanel returned OK but no referenceId for installation %s; "
+                "will verify panel state via direct status check",
+                installation.number,
             )
-            count = count + 1
+            # No polling happened — give the panel time to process the command
+            # before we query its state directly.
+            await asyncio.sleep(self.delay_check_operation * 3)
+
+        # If we still have no confirmed panel state (empty referenceId or all
+        # retries returned error_no_response_to_request), fall back to a direct
+        # CheckAlarm call so we at least return the real current protomResponse.
+        if not raw_data.get("protomResponse"):
+            _LOGGER.warning(
+                "No protomResponse from disarm polling; checking actual panel state"
+            )
+            try:
+                check_ref = await self.check_alarm(installation)
+                check_status = await self.check_alarm_status(installation, check_ref)
+                if check_status.protomResponse:
+                    self.protom_response = check_status.protomResponse
+                return DisarmStatus(
+                    error=None,
+                    message=check_status.message,
+                    numinst=check_status.InstallationNumer,
+                    protomResponse=check_status.protomResponse,
+                    protomResponseData=check_status.protomResponseData,
+                    requestId="",
+                    operation_status=check_status.operation_status,
+                    status=check_status.status,
+                )
+            except SecuritasDirectError as err:
+                _LOGGER.error(
+                    "Failed to verify panel state after disarm: %s", err
+                )
+                # Return what we have; the periodic update will correct the HA state.
+                return DisarmStatus(
+                    error=str(err),
+                    message="Disarm status unknown; panel state check failed",
+                )
 
         if raw_data.get("protomResponse"):
             self.protom_response = raw_data["protomResponse"]
