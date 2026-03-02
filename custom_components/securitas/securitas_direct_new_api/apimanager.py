@@ -1090,7 +1090,7 @@ class ApiManager:
                 "panel": installation.panel,
                 "currentStatus": self.protom_response,
             },
-            "query": "mutation xSDisarmPanel($numinst: String!, $request: DisarmCodeRequest!, $panel: String!) {\n  xSDisarmPanel(numinst: $numinst, request: $request, panel: $panel) {\n    res\n    msg\n    referenceId\n  }\n}\n",
+            "query": "mutation xSDisarmPanel($numinst: String!, $request: DisarmCodeRequest!, $panel: String!, $currentStatus: String) {\n  xSDisarmPanel(numinst: $numinst, request: $request, panel: $panel, currentStatus: $currentStatus) {\n    res\n    msg\n    referenceId\n  }\n}\n",
         }
         await self._check_authentication_token()
         await self._check_capabilities_token(installation)
