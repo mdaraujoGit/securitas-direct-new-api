@@ -20,11 +20,11 @@ from homeassistant.const import (
     CONF_USERNAME,
 )
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import selector
 
 from . import (
+    CONF_CODE_ARM_REQUIRED,
     CONF_CHECK_ALARM_PANEL,
     CONF_COUNTRY,
     CONF_DELAY_CHECK_OPERATION,
@@ -34,13 +34,16 @@ from . import (
     CONF_MAP_CUSTOM,
     CONF_MAP_HOME,
     CONF_MAP_NIGHT,
+    CONF_NOTIFY_GROUP,
     CONF_PERI_ALARM,
     CONF_USE_2FA,
     CONFIG_SCHEMA,
+    DEFAULT_CODE_ARM_REQUIRED,
     DEFAULT_CHECK_ALARM_PANEL,
     DEFAULT_DELAY_CHECK_OPERATION,
     DEFAULT_PERI_ALARM,
     DEFAULT_SCAN_INTERVAL,
+    DEFAULT_CODE,
     DOMAIN,
     SecuritasDirectDevice,
     SecuritasHub,
@@ -71,12 +74,12 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialize the flow handler."""
         self.config: OrderedDict = OrderedDict()
-        self.securitas: SecuritasHub = None
-        self.otp_challenge: tuple[str, list[OtpPhone]] = None
+        self.securitas: SecuritasHub | None = None
+        self.otp_challenge: tuple[str | None, list[OtpPhone] | None] | None = None
 
     async def _create_entry(
         self, username: str, data: OrderedDict
-    ) -> config_entries.ConfigEntry:
+    ) -> config_entries.ConfigFlowResult:
         """Register new entry."""
 
         await self.async_set_unique_id(username)
@@ -99,35 +102,47 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.securitas
 
-    async def async_step_phone_list(self, user_input=None) -> FlowResult:
+    async def async_step_phone_list(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
         """Show the list of phones for the OTP challenge."""
         phone_index: int = -1
+        assert user_input is not None
         selected_phone_key = user_input["phones"]
-        
+
+        assert self.otp_challenge is not None
+        assert self.securitas is not None
+        otp_phones = self.otp_challenge[1] or []
         try:
             index_str = selected_phone_key.split("_")[0]
             list_index = int(index_str)
-            if 0 <= list_index < len(self.otp_challenge[1]):
-                phone_index = self.otp_challenge[1][list_index].id
+            if 0 <= list_index < len(otp_phones):
+                phone_index = otp_phones[list_index].id
         except (ValueError, IndexError):
-            for phone_item in self.otp_challenge[1]:
+            for phone_item in otp_phones:
                 if phone_item.phone in selected_phone_key:
                     phone_index = phone_item.id
                     break
-        
-        await self.securitas.send_opt(self.otp_challenge[0], phone_index)
+
+        await self.securitas.send_opt(self.otp_challenge[0] or "", phone_index)
         return self.async_show_form(
             step_id="otp_challenge",
             data_schema=vol.Schema({vol.Required(CONF_CODE): str}),
         )
 
-    async def async_step_otp_challenge(self, user_input=None):
+    async def async_step_otp_challenge(self, user_input: dict[str, Any] | None = None):
         """Last step of the OTP challenge."""
-        await self.securitas.send_sms_code(self.otp_challenge[0], user_input[CONF_CODE])
+        assert self.securitas is not None
+        assert self.otp_challenge is not None
+        assert user_input is not None
+        await self.securitas.send_sms_code(
+            self.otp_challenge[0] or "", user_input[CONF_CODE]
+        )
         return await self.finish_setup()
 
     async def finish_setup(self):
         """Login and set up installations."""
+        assert self.securitas is not None
         await self.securitas.login()
         self.config[CONF_TOKEN] = self.securitas.get_authentication_token()
         result = await self._create_entry(self.config[CONF_USERNAME], self.config)
@@ -152,7 +167,9 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         """Get the options flow for this handler."""
         return SecuritasOptionsFlowHandler()
 
-    async def async_step_user(self, user_input=None):
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
         """User initiated config flow."""
         if (user_input is None and self.init_data is None) or (
             self.init_data is not None and self.init_data.get("error", None) == "login"
@@ -162,9 +179,12 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 data_schema=CONFIG_SCHEMA.schema[DOMAIN],
             )
 
-        self.config: OrderedDict = user_input
-        if self.config is None:
-            self.config = self.init_data.copy()
+        if user_input is not None:
+            self.config = OrderedDict(user_input)
+        else:
+            self.config = (
+                OrderedDict(self.init_data.copy()) if self.init_data else OrderedDict()
+            )
 
         if self.securitas is None:
             uuid = generate_uuid()
@@ -180,18 +200,15 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if not self.config[CONF_USE_2FA]:
             return await self.finish_setup()
 
-        self.otp_challenge: tuple[
-            str, list[OtpPhone]
-        ] = await self.securitas.validate_device()
+        otp_result = await self.securitas.validate_device()
+        self.otp_challenge = otp_result
         phones: list[str] = []
         phone_options: list[dict] = []
-        for i, phone_item in enumerate(self.otp_challenge[1]):
+        otp_phones = otp_result[1] or []
+        for i, phone_item in enumerate(otp_phones):
             phone_key = f"{i}_{phone_item.phone}"
             phones.append(phone_key)
-            phone_options.append({
-                "value": phone_key,
-                "label": phone_item.phone
-            })
+            phone_options.append({"value": phone_key, "label": phone_item.phone})
         data_schema = {}
         data_schema["phones"] = selector({"select": {"options": phone_options}})
         return self.async_show_form(
@@ -216,9 +233,18 @@ class FlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         self.config[CONF_PASSWORD] = user_input[CONF_PASSWORD]
         self.config[CONF_COUNTRY] = user_input[CONF_COUNTRY]
         self.config[CONF_CODE] = user_input[CONF_CODE]
-        self.config[CONF_CHECK_ALARM_PANEL] = user_input[CONF_CHECK_ALARM_PANEL]
-        self.config[CONF_SCAN_INTERVAL] = user_input[CONF_SCAN_INTERVAL]
-        self.config[CONF_DELAY_CHECK_OPERATION] = user_input[CONF_DELAY_CHECK_OPERATION]
+        self.config[CONF_CODE_ARM_REQUIRED] = user_input.get(
+            CONF_CODE_ARM_REQUIRED, DEFAULT_CODE_ARM_REQUIRED
+        )
+        self.config[CONF_CHECK_ALARM_PANEL] = user_input.get(
+            CONF_CHECK_ALARM_PANEL, DEFAULT_CHECK_ALARM_PANEL
+        )
+        self.config[CONF_SCAN_INTERVAL] = user_input.get(
+            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+        )
+        self.config[CONF_DELAY_CHECK_OPERATION] = user_input.get(
+            CONF_DELAY_CHECK_OPERATION, DEFAULT_DELAY_CHECK_OPERATION
+        )
         self.config[CONF_DEVICE_ID] = user_input[CONF_DEVICE_ID]
         self.config[CONF_UNIQUE_ID] = user_input[CONF_UNIQUE_ID]
         self.config[CONF_DEVICE_INDIGITALL] = user_input[CONF_DEVICE_INDIGITALL]
@@ -256,40 +282,62 @@ class SecuritasOptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         """Step 1: General settings."""
         if user_input is not None:
+            user_input.setdefault(CONF_CODE, DEFAULT_CODE)
             self._general_data = user_input
             return await self.async_step_mappings()
-
         scan_interval = self._get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-        code = ""
+
+        code_arm_required = self._get(CONF_CODE_ARM_REQUIRED, DEFAULT_CODE_ARM_REQUIRED)
         delay_check_operation = self._get(
             CONF_DELAY_CHECK_OPERATION, DEFAULT_DELAY_CHECK_OPERATION
         )
-        check_alarm_panel = self._get(
-            CONF_CHECK_ALARM_PANEL, DEFAULT_CHECK_ALARM_PANEL
-        )
+        check_alarm_panel = self._get(CONF_CHECK_ALARM_PANEL, DEFAULT_CHECK_ALARM_PANEL)
         peri_alarm = self._get(CONF_PERI_ALARM, DEFAULT_PERI_ALARM)
+
+        notify_group = self._get(CONF_NOTIFY_GROUP, "")
+
+        _NOTIFY_EXCLUDE = {"notify", "send_message", "persistent_notification"}
+        notify_services = sorted(
+            svc
+            for svc in self.hass.services.async_services().get("notify", {}).keys()
+            if svc not in _NOTIFY_EXCLUDE
+        )
+        notify_options = [{"value": "", "label": "(disabled)"}] + [
+            {"value": svc, "label": svc} for svc in notify_services
+        ]
 
         schema = vol.Schema(
             {
-                vol.Optional(CONF_CODE, default=code): str,
-                vol.Optional(CONF_PERI_ALARM, default=peri_alarm): bool,
                 vol.Optional(
-                    CONF_CHECK_ALARM_PANEL, default=check_alarm_panel
-                ): bool,
+                    CONF_CODE,
+                    description={"suggested_value": self._get(CONF_CODE, DEFAULT_CODE)},
+                ): str,
+                vol.Optional(CONF_CODE_ARM_REQUIRED, default=code_arm_required): bool,
+                vol.Optional(CONF_PERI_ALARM, default=peri_alarm): bool,
+                vol.Optional(CONF_CHECK_ALARM_PANEL, default=check_alarm_panel): bool,
                 vol.Optional(CONF_SCAN_INTERVAL, default=scan_interval): int,
                 vol.Optional(
                     CONF_DELAY_CHECK_OPERATION, default=delay_check_operation
                 ): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=15.0)),
+                vol.Optional(CONF_NOTIFY_GROUP, default=notify_group): selector(
+                    {
+                        "select": {
+                            "options": notify_options,
+                            "custom_value": True,
+                            "mode": "dropdown",
+                        }
+                    }
+                ),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
 
     async def async_step_mappings(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> config_entries.ConfigFlowResult:
         """Step 2: Alarm state mappings."""
         if user_input is not None:
             data = {**self._general_data, **user_input}
@@ -314,8 +362,7 @@ class SecuritasOptionsFlowHandler(config_entries.OptionsFlow):
 
         # Build dropdown options
         select_options = [
-            {"value": state.value, "label": STATE_LABELS[state]}
-            for state in options
+            {"value": state.value, "label": STATE_LABELS[state]} for state in options
         ]
 
         schema = vol.Schema(

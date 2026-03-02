@@ -15,7 +15,6 @@ from .dataTypes import (
     AirQuality,
     ArmStatus,
     Attribute,
-    Attributes,
     CheckAlarmStatus,
     DisarmStatus,
     Installation,
@@ -28,9 +27,33 @@ from .dataTypes import (
     SmartLockModeStatus,
 )
 from .domains import ApiDomains
-from .exceptions import ArmWithOpenSensorsError, Login2FAError, LoginError, SecuritasDirectError
+from .exceptions import (
+    ArmingExceptionError,
+    ArmWithOpenSensorsError,
+    Login2FAError,
+    LoginError,
+    SecuritasDirectError,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+# API protocol constants
+API_CALLBY = "OWA_10"
+API_ID_PREFIX = "OWA_______________"
+
+# Smart-lock device identifiers expected by the Securitas API
+SMARTLOCK_DEVICE_TYPE = "DR"
+SMARTLOCK_DEVICE_ID = "01"
+SMARTLOCK_KEY_TYPE = "0"
+
+# Service ID used when polling CheckAlarmStatus
+ALARM_STATUS_SERVICE_ID = "11"
+
+# Default timeout (seconds) for check_alarm_status polling loop
+CHECK_ALARM_STATUS_TIMEOUT = 10
+
+# Extra settle delay after a lock-mode change completes (multiples of delay_check_operation)
+LOCK_MODE_SETTLE_MULTIPLIER = 7
 
 
 def generate_uuid() -> str:
@@ -67,7 +90,7 @@ class ApiManager:
         self.delay_check_operation: int = delay_check_operation
 
         self.protom_response: str = ""
-        self.authentication_token: str = ""
+        self.authentication_token: str | None = ""
         self.authentication_token_exp: datetime = datetime.min
         self.login_timestamp: int = 0
         self.authentication_otp_challenge_value: Optional[tuple[str, str]] = None
@@ -111,7 +134,7 @@ class ApiManager:
                 "id": self._generate_id(),
                 "country": self.country,
                 "lang": self.language,
-                "callby": "OWA_10",
+                "callby": API_CALLBY,
                 "hash": self.authentication_token,
             }
             headers["auth"] = json.dumps(authorization_value)
@@ -123,7 +146,7 @@ class ApiManager:
                 "id": self._generate_id(),
                 "country": self.country,
                 "lang": self.language,
-                "callby": "OWA_10",
+                "callby": API_CALLBY,
                 "hash": "",
                 "refreshToken": "",
             }
@@ -152,6 +175,7 @@ class ApiManager:
             async with self.http_client.post(
                 self.api_url, headers=headers, json=content
             ) as response:
+                http_status: int = response.status
                 response_text: str = await response.text()
         except ClientConnectorError as err:
             raise SecuritasDirectError(
@@ -161,8 +185,22 @@ class ApiManager:
         _LOGGER.debug("--------------Response--------------")
         _LOGGER.debug(response_text)
 
+        if http_status >= 400:
+            _LOGGER.debug(
+                "HTTP %d from Securitas API for operation '%s': %s",
+                http_status,
+                operation,
+                response_text[:500],
+            )
+            raise SecuritasDirectError(
+                f"HTTP {http_status} from Securitas API ({operation})",
+                None,
+                headers,
+                content,
+            )
+
         try:
-            # error_login: bool = await self._check_errros(response_text)
+            # error_login: bool = await self._check_errors(response_text)
             # if error_login:
             # response_text: str = await self._execute_request(
             #     content, operation, installation
@@ -172,21 +210,45 @@ class ApiManager:
             _LOGGER.error("Problems decoding response %s", response_text)
             raise SecuritasDirectError(err.msg, None, headers, content) from err
 
-        if (
-            "errors" in response_dict
-            and "data" in response_dict["errors"]
-            and "reason" in response_dict["errors"]["data"]
-        ):
-            raise SecuritasDirectError(
-                response_dict["errors"]["data"]["reason"],
-                response_dict,
-                headers,
-                content,
-            )
+        if "errors" in response_dict:
+            errors = response_dict["errors"]
+            if (
+                isinstance(errors, dict)
+                and "data" in errors
+                and "reason" in errors["data"]
+            ):
+                raise SecuritasDirectError(
+                    errors["data"]["reason"],
+                    response_dict,
+                    headers,
+                    content,
+                )
+            elif isinstance(errors, list) and errors and "data" in response_dict:
+                # Partial GraphQL response: errors list alongside a data key.
+                # Only raise automatically when the operation result is null/empty
+                # (all data values are None), so callers that handle partial data
+                # themselves are not affected.
+                data = response_dict["data"]
+                all_null = data is None or (
+                    isinstance(data, dict) and all(v is None for v in data.values())
+                )
+                if all_null:
+                    first = errors[0]
+                    message = (
+                        first.get("message", str(first))
+                        if isinstance(first, dict)
+                        else str(first)
+                    )
+                    raise SecuritasDirectError(
+                        message,
+                        response_dict,
+                        headers,
+                        content,
+                    )
 
         return response_dict
 
-    async def _check_errros(self, value: str) -> bool:
+    async def _check_errors(self, value: str) -> bool:
         if value is not None:
             response = json.loads(value)
             if "errors" in response:
@@ -234,13 +296,21 @@ class ApiManager:
         if (self.authentication_token is None) or (
             datetime.now() + timedelta(minutes=1) > self.authentication_token_exp
         ):
+            if self.refresh_token_value:
+                _LOGGER.debug("Authentication token expired, refreshing")
+                try:
+                    if await self.refresh_token():
+                        return
+                    _LOGGER.debug("Refresh token failed, falling back to login")
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug("Refresh token error, falling back to login")
             _LOGGER.debug("Authentication token expired, logging in again")
             await self.login()
 
     def _generate_id(self) -> str:
         current: datetime = datetime.now()
         return (
-            "OWA_______________"
+            API_ID_PREFIX
             + self.username
             + "_______________"
             + str(current.year)
@@ -260,17 +330,18 @@ class ApiManager:
         }
         await self._execute_request(content, "Logout")
 
-    def _extract_otp_data(self, data) -> tuple[str, list[OtpPhone]]:
-        otp_hash = data["auth-otp-hash"]
+    def _extract_otp_data(self, data) -> tuple[str | None, list[OtpPhone]]:
+        if not data:
+            return (None, [])
+        otp_hash = data.get("auth-otp-hash")
         phones: list[OtpPhone] = []
-        for item in data["auth-phones"]:
+        for item in data.get("auth-phones", []):
             phones.append(OtpPhone(item["id"], item["phone"]))
-
         return (otp_hash, phones)
 
     async def validate_device(
         self, otp_succeed: bool, auth_otp_hash: str, sms_code: str
-    ) -> tuple[str, list[OtpPhone]]:
+    ) -> tuple[str | None, list[OtpPhone] | None]:
         """Validate the device."""
         content = {
             "operationName": "mkValidateDevice",
@@ -288,19 +359,42 @@ class ApiManager:
 
         if otp_succeed:
             self.authentication_otp_challenge_value = (auth_otp_hash, sms_code)
-        response = {}
         try:
             response = await self._execute_request(content, "mkValidateDevice")
             self.authentication_otp_challenge_value = None
         except SecuritasDirectError as err:
             # the API call fails but we want the phone data in the response
-            return self._extract_otp_data(err.args[1]["errors"][0]["data"])
+            if len(err.args) > 1 and err.args[1] is not None:
+                try:
+                    return self._extract_otp_data(err.args[1]["errors"][0]["data"])
+                except (KeyError, IndexError, TypeError):
+                    pass
+            raise
 
         if "errors" in response and response["errors"][0]["message"] == "Unauthorized":
             # the API call succeeds but is unauthorized
             return self._extract_otp_data(response["errors"][0]["data"])
 
-        self.authentication_token = response["data"]["xSValidateDevice"]["hash"]
+        validate_data = response["data"]["xSValidateDevice"]
+        if validate_data is None:
+            raise SecuritasDirectError("xSValidateDevice response is None", response)
+        self.authentication_token = validate_data["hash"]
+        try:
+            assert self.authentication_token is not None
+            token = jwt.decode(
+                self.authentication_token,
+                algorithms=["HS256"],
+                options={"verify_signature": False},
+            )
+        except jwt.exceptions.DecodeError:
+            _LOGGER.warning(
+                "Failed to decode authentication token after device validation"
+            )
+        else:
+            if "exp" in token:
+                self.authentication_token_exp = datetime.fromtimestamp(token["exp"])
+        if validate_data.get("refreshToken"):
+            self.refresh_token_value = validate_data["refreshToken"]
         return (None, None)
 
     async def refresh_token(self) -> bool:
@@ -309,16 +403,52 @@ class ApiManager:
             "operationName": "RefreshLogin",
             "variables": {
                 "refreshToken": self.refresh_token_value,
-                "uuid": self.uuid,  # uuid4(),
+                "id": self._generate_id(),
+                "uuid": self.uuid,
                 "country": self.country,
                 "lang": self.language,
-                "callby": "OWA_10",
+                "callby": API_CALLBY,
+                "idDevice": self.device_id,
+                "idDeviceIndigitall": self.id_device_indigitall,
+                "deviceType": self.device_type,
+                "deviceVersion": self.device_version,
+                "deviceResolution": self.device_resolution,
+                "deviceName": self.device_name,
+                "deviceBrand": self.device_brand,
+                "deviceOsVersion": self.device_os_version,
             },
             "query": "mutation RefreshLogin($refreshToken: String!, $id: String!, $country: String!, $lang: String!, $callby: String!, $idDevice: String!, $idDeviceIndigitall: String!, $deviceType: String!, $deviceVersion: String!, $deviceResolution: String!, $deviceName: String!, $deviceBrand: String!, $deviceOsVersion: String!, $uuid: String!) {\n  xSRefreshLogin(refreshToken: $refreshToken, id: $id, country: $country, lang: $lang, callby: $callby, idDevice: $idDevice, idDeviceIndigitall: $idDeviceIndigitall, deviceType: $deviceType, deviceVersion: $deviceVersion, deviceResolution: $deviceResolution, deviceName: $deviceName, deviceBrand: $deviceBrand, deviceOsVersion: $deviceOsVersion, uuid: $uuid) {\n    __typename\n    res\n    msg\n    hash\n    refreshToken\n    legals\n    changePassword\n    needDeviceAuthorization\n    mainUser\n  }\n}",
         }
         response = await self._execute_request(content, "RefreshLogin")
 
-        return response["data"]["xSSendOtp"]["res"]
+        refresh_data = response["data"]["xSRefreshLogin"]
+        if refresh_data is None:
+            raise SecuritasDirectError("xSRefreshLogin response is None", response)
+
+        if refresh_data.get("res") != "OK":
+            return False
+
+        if refresh_data.get("hash"):
+            self.authentication_token = refresh_data["hash"]
+            try:
+                assert self.authentication_token is not None
+                token = jwt.decode(
+                    self.authentication_token,
+                    algorithms=["HS256"],
+                    options={"verify_signature": False},
+                )
+            except jwt.exceptions.DecodeError:
+                _LOGGER.warning("Failed to decode refreshed authentication token")
+                return False
+            if "exp" in token:
+                self.authentication_token_exp = datetime.fromtimestamp(token["exp"])
+            self.login_timestamp = int(datetime.now().timestamp() * 1000)
+        else:
+            return False
+        if refresh_data.get("refreshToken"):
+            self.refresh_token_value = refresh_data["refreshToken"]
+
+        return True
 
     async def send_otp(self, device_id: int, auth_otp_hash: str) -> bool:
         """Send the OTP device challenge."""
@@ -332,7 +462,10 @@ class ApiManager:
         }
         response = await self._execute_request(content, "mkSendOTP")
 
-        return response["data"]["xSSendOtp"]["res"]
+        otp_data = response["data"]["xSSendOtp"]
+        if otp_data is None:
+            raise SecuritasDirectError("xSSendOtp response is None", response)
+        return otp_data["res"]
 
     async def login(self) -> None:
         """Send Login info and sets authentication token."""
@@ -344,7 +477,7 @@ class ApiManager:
                 "password": self.password,
                 "id": self._generate_id(),
                 "country": self.country,
-                "callby": "OWA_10",
+                "callby": API_CALLBY,
                 "lang": self.language,
                 "idDevice": self.device_id,
                 "idDeviceIndigitall": self.id_device_indigitall,
@@ -363,29 +496,40 @@ class ApiManager:
         try:
             response = await self._execute_request(content, "mkLoginToken")
         except SecuritasDirectError as err:
-            result_json = err.args[1]
-            if result_json.get("data"):
+            result_json = err.args[1] if len(err.args) > 1 else None
+            if result_json is not None and result_json.get("data"):
                 if result_json["data"].get("xSLoginToken"):
-                    if result_json["data"]["xSLoginToken"].get("needDeviceAuthorization"):
+                    if result_json["data"]["xSLoginToken"].get(
+                        "needDeviceAuthorization"
+                    ):
                         # needs a 2FA
                         raise Login2FAError(err.args) from err
-
-            raise LoginError(err.args) from err
+                raise LoginError(err.args) from err
+            # No response data (connection/network error) — let
+            # SecuritasDirectError propagate so HA can retry setup
+            raise
 
         if "errors" in response:
             _LOGGER.error("Login error %s", response["errors"][0]["message"])
             raise LoginError(response["errors"][0]["message"], response)
 
         # Check if 2FA is required even on successful response
-        if response["data"]["xSLoginToken"].get("needDeviceAuthorization", False):
+        login_data = response["data"]["xSLoginToken"]
+        if login_data is None:
+            raise SecuritasDirectError("xSLoginToken response is None", response)
+        if login_data.get("needDeviceAuthorization", False):
             # needs a 2FA
             raise Login2FAError("2FA authentication required", response)
 
-        if response["data"]["xSLoginToken"]["hash"] is not None:
-            self.authentication_token = response["data"]["xSLoginToken"]["hash"]
+        if login_data.get("refreshToken"):
+            self.refresh_token_value = login_data["refreshToken"]
+
+        if login_data["hash"] is not None:
+            self.authentication_token = login_data["hash"]
             self.login_timestamp = int(datetime.now().timestamp() * 1000)
 
             try:
+                assert self.authentication_token is not None
                 token = jwt.decode(
                     self.authentication_token,
                     algorithms=["HS256"],
@@ -411,7 +555,10 @@ class ApiManager:
         response = await self._execute_request(content, "mkInstallationList")
 
         result: list[Installation] = []
-        raw_installations = response["data"]["xSInstallations"]["installations"]
+        installations_data = response["data"]["xSInstallations"]
+        if installations_data is None:
+            raise SecuritasDirectError("xSInstallations response is None", response)
+        raw_installations = installations_data["installations"]
         for item in raw_installations:
             installation_item: Installation = Installation(
                 item["numinst"],
@@ -446,7 +593,11 @@ class ApiManager:
         await self._check_capabilities_token(installation)
         response = await self._execute_request(content, "CheckAlarm", installation)
 
-        return response["data"]["xSCheckAlarm"]["referenceId"]
+        check_alarm = response.get("data", {}).get("xSCheckAlarm")
+        if check_alarm is None:
+            raise SecuritasDirectError("API returned no check alarm data", response)
+
+        return check_alarm["referenceId"]
 
     async def get_all_services(self, installation: Installation) -> list[Service]:
         """Get the list of all services available to the user."""
@@ -457,11 +608,26 @@ class ApiManager:
         }
         response = await self._execute_request(content, "Srv")
 
+        installation_data = (response.get("data") or {}).get("xSSrv") or {}
+        installation_data = installation_data.get("installation")
+        if installation_data is None:
+            _LOGGER.warning(
+                "API returned no installation data for %s", installation.number
+            )
+            return []
+
         result: list[Service] = []
-        raw_data = response["data"]["xSSrv"]["installation"]["services"]
-        installation.capabilities = response["data"]["xSSrv"]["installation"][
-            "capabilities"
-        ]
+        raw_data = installation_data.get("services")
+        if raw_data is None:
+            _LOGGER.warning("API returned no services for %s", installation.number)
+            return []
+
+        capabilities = installation_data.get("capabilities")
+        if capabilities is None:
+            _LOGGER.warning("API returned no capabilities for %s", installation.number)
+            return []
+
+        installation.capabilities = capabilities
         try:
             token = jwt.decode(
                 installation.capabilities,
@@ -492,7 +658,6 @@ class ApiManager:
                             bool(attribute_item["active"]),
                         )
                     )
-        
 
             result.append(
                 Service(
@@ -537,15 +702,22 @@ class ApiManager:
         if "errors" in response:
             return Sentinel("", "", 0, 0)
 
+        if not service.attributes or not isinstance(service.attributes, list):
+            _LOGGER.warning("No attributes found for sentinel service %s", service.id)
+            return Sentinel("", "", 0, 0)
+
         zone = service.attributes[0].value
-        devices = response["data"]["xSComfort"]["devices"]
+        comfort_data = response["data"]["xSComfort"]
+        if comfort_data is None:
+            return Sentinel("", "", 0, 0)
+        devices = comfort_data["devices"]
         target_device = None
-        
+
         for device in devices:
             if device.get("zone") == zone:
                 target_device = device
                 break
-        
+
         if target_device is None:
             return Sentinel("", "", 0, 0)
 
@@ -560,11 +732,19 @@ class ApiManager:
         self, installation: Installation, service: Service
     ) -> AirQuality:
         """Get sentinel status."""
+        zone_val = "0"
+        if service.attributes and isinstance(service.attributes, list):
+            zone_val = str(service.attributes[0].value)
+        else:
+            _LOGGER.warning(
+                "No attributes found for air quality service %s", service.id
+            )
+
         content = {
             "operationName": "AirQualityGraph",
             "variables": {
                 "numinst": installation.number,
-                "zone": str(service.attributes[0].value),
+                "zone": zone_val,
             },
             "query": "query AirQualityGraph($numinst: String!, $zone: String!) {\n  xSAirQ(numinst: $numinst, zone: $zone) {\n    res\n    msg\n    graphData {\n      status {\n        avg6h\n        avg6hMsg\n        avg24h\n        avg24hMsg\n        avg7d\n        avg7dMsg\n        avg4w\n        avg4wMsg\n        current\n        currentMsg\n      }\n      daysTotal\n      days {\n        id\n        value\n      }\n      hoursTotal\n      hours {\n        id\n        value\n      }\n      weeksTotal\n      weeks {\n        id\n        value\n      }\n    }\n  }\n}",
         }
@@ -575,7 +755,10 @@ class ApiManager:
         if "errors" in response:
             return AirQuality(0, "")
 
-        raw_data = response["data"]["xSAirQ"]["graphData"]["status"]
+        air_data = response["data"]["xSAirQ"]
+        if air_data is None:
+            return AirQuality(0, "")
+        raw_data = air_data["graphData"]["status"]
         return AirQuality(
             int(raw_data["current"]),
             raw_data["currentMsg"],
@@ -598,12 +781,17 @@ class ApiManager:
 
         if "data" in response:
             raw_data = response["data"]["xSStatus"]
+            if raw_data is None:
+                return SStatus(None, None)
             return SStatus(raw_data["status"], raw_data["timestampUpdate"])
 
         return SStatus(None, None)
 
     async def check_alarm_status(
-        self, installation: Installation, reference_id: str, timeout: int = 10
+        self,
+        installation: Installation,
+        reference_id: str,
+        timeout: int = CHECK_ALARM_STATUS_TIMEOUT,
     ) -> CheckAlarmStatus:
         """Return the status of the alarm."""
         await self._check_authentication_token()
@@ -639,7 +827,7 @@ class ApiManager:
                 "numinst": installation.number,
                 "panel": installation.panel,
                 "referenceId": reference_id,
-                "idService": "11",
+                "idService": ALARM_STATUS_SERVICE_ID,
                 "counter": count,
             },
             "query": "query CheckAlarmStatus($numinst: String!, $idService: String!, $panel: String!, $referenceId: String!) {\n  xSCheckAlarmStatus(numinst: $numinst, idService: $idService, panel: $panel, referenceId: $referenceId) {\n    res\n    msg\n    status\n    numinst\n    protomResponse\n    protomResponseDate\n  }\n}\n",
@@ -648,38 +836,96 @@ class ApiManager:
             content, "CheckAlarmStatus", installation
         )
 
-        return response["data"]["xSCheckAlarmStatus"]
+        check_data = response["data"]["xSCheckAlarmStatus"]
+        if check_data is None:
+            raise SecuritasDirectError("xSCheckAlarmStatus response is None", response)
+        return check_data
 
     async def arm_alarm(
-        self, installation: Installation, command: str
+        self,
+        installation: Installation,
+        command: str,
+        force_arming_remote_id: str | None = None,
+        suid: str | None = None,
     ) -> ArmStatus:
-        """Arms the alarm in the specified mode."""
+        """Arms the alarm in the specified mode.
+
+        When force_arming_remote_id and suid are provided, the arm request
+        overrides non-blocking exceptions (e.g. open windows) that were
+        reported in a previous attempt.
+        """
+        variables: dict[str, Any] = {
+            "request": command,
+            "numinst": installation.number,
+            "panel": installation.panel,
+            "currentStatus": self.protom_response,
+            "armAndLock": False,
+        }
+        if force_arming_remote_id is not None:
+            variables["forceArmingRemoteId"] = force_arming_remote_id
+        if suid is not None:
+            variables["suid"] = suid
+
         content = {
             "operationName": "xSArmPanel",
-            "variables": {
-                "request": command,
-                "numinst": installation.number,
-                "panel": installation.panel,
-                "currentStatus": self.protom_response,
-            },
-            "query": "mutation xSArmPanel($numinst: String!, $request: ArmCodeRequest!, $panel: String!, $currentStatus: String) {\n  xSArmPanel(numinst: $numinst, request: $request, panel: $panel, currentStatus: $currentStatus) {\n    res\n    msg\n    referenceId\n  }\n}\n",
+            "variables": variables,
+            "query": (
+                "mutation xSArmPanel($numinst: String!, $request: ArmCodeRequest!,"
+                " $panel: String!, $currentStatus: String, $suid: String,"
+                " $forceArmingRemoteId: String, $armAndLock: Boolean) {\n"
+                "  xSArmPanel(numinst: $numinst, request: $request, panel: $panel,"
+                " currentStatus: $currentStatus, suid: $suid,"
+                " forceArmingRemoteId: $forceArmingRemoteId,"
+                " armAndLock: $armAndLock) {\n"
+                "    res\n    msg\n    referenceId\n  }\n}\n"
+            ),
         }
         await self._check_authentication_token()
         await self._check_capabilities_token(installation)
         response = await self._execute_request(content, "xSArmPanel", installation)
-        response = response["data"]["xSArmPanel"]
-        if response["res"] != "OK":
-            raise SecuritasDirectError(response["msg"], response)
+        arm_data = response["data"]["xSArmPanel"]
+        if arm_data is None:
+            raise SecuritasDirectError("xSArmPanel response is None", response)
+        if arm_data["res"] != "OK":
+            raise SecuritasDirectError(arm_data["msg"], response)
 
-        reference_id = response["referenceId"]
+        reference_id = arm_data["referenceId"]
 
         count = 1
         raw_data: dict[str, Any] = {}
+        max_retries = max(10, round(30 / max(1, self.delay_check_operation)))
         while (count == 1) or (raw_data.get("res") == "WAIT"):
+            if count > max_retries:
+                _LOGGER.warning(
+                    "Arm status check exceeded max retries (%d), last response: %s",
+                    max_retries,
+                    raw_data,
+                )
+                break
             await asyncio.sleep(self.delay_check_operation)
             raw_data = await self._check_arm_status(
-                installation, reference_id, command, count
+                installation,
+                reference_id,
+                command,
+                count,
+                force_arming_remote_id,
             )
+
+            # Detect non-blocking exception that allows forcing
+            error = raw_data.get("error")
+            if (
+                raw_data.get("res") == "ERROR"
+                and error
+                and error.get("type") == "NON_BLOCKING"
+                and error.get("allowForcing")
+            ):
+                error_ref = error.get("referenceId", reference_id)
+                error_suid = error.get("suid", "")
+                exceptions = await self._get_exceptions(
+                    installation, error_ref, error_suid
+                )
+                raise ArmingExceptionError(error_ref, error_suid, exceptions)
+
             count += 1
 
         error = raw_data.get("error")
@@ -760,24 +1006,77 @@ class ApiManager:
         reference_id: str,
         command: str,
         counter: int,
+        force_arming_remote_id: str | None = None,
     ) -> dict[str, Any]:
-        """Check progress of the alarm."""
+        """Check progress of the arm operation."""
+        variables: dict[str, Any] = {
+            "request": command,
+            "numinst": installation.number,
+            "panel": installation.panel,
+            "referenceId": reference_id,
+            "counter": counter,
+            "armAndLock": False,
+        }
+        if force_arming_remote_id is not None:
+            variables["forceArmingRemoteId"] = force_arming_remote_id
+
         content = {
             "operationName": "ArmStatus",
-            "variables": {
-                "request": command,
-                "numinst": installation.number,
-                "panel": installation.panel,
-                "currentStatus": self.protom_response,
-                "referenceId": reference_id,
-                "counter": counter,
-            },
-            "query": "query ArmStatus($numinst: String!, $request: ArmCodeRequest, $panel: String!, $referenceId: String!, $counter: Int!) {\n  xSArmStatus(numinst: $numinst, panel: $panel, referenceId: $referenceId, counter: $counter, request: $request) {\n    res\n    msg\n    status\n    protomResponse\n    protomResponseDate\n    numinst\n    requestId\n    error {\n      code\n      type\n      allowForcing\n      exceptionsNumber\n      referenceId\n    }\n  }\n}\n",
+            "variables": variables,
+            "query": (
+                "query ArmStatus($numinst: String!, $request: ArmCodeRequest,"
+                " $panel: String!, $referenceId: String!, $counter: Int!,"
+                " $forceArmingRemoteId: String, $armAndLock: Boolean) {\n"
+                "  xSArmStatus(numinst: $numinst, panel: $panel,"
+                " referenceId: $referenceId, counter: $counter, request: $request,"
+                " forceArmingRemoteId: $forceArmingRemoteId,"
+                " armAndLock: $armAndLock) {\n"
+                "    res\n    msg\n    status\n    protomResponse\n"
+                "    protomResponseDate\n    numinst\n    requestId\n"
+                "    error {\n      code\n      type\n      allowForcing\n"
+                "      exceptionsNumber\n      referenceId\n      suid\n    }\n"
+                "  }\n}\n"
+            ),
         }
         response = await self._execute_request(content, "ArmStatus", installation)
 
         raw_data = response["data"]["xSArmStatus"]
+        if raw_data is None:
+            raise SecuritasDirectError("xSArmStatus response is None", response)
         return raw_data
+
+    async def _get_exceptions(
+        self,
+        installation: Installation,
+        reference_id: str,
+        suid: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch arming exception details (e.g. open windows/doors)."""
+        content = {
+            "operationName": "xSGetExceptions",
+            "variables": {
+                "numinst": installation.number,
+                "panel": installation.panel,
+                "referenceId": reference_id,
+                "counter": 1,
+                "suid": suid,
+            },
+            "query": (
+                "query xSGetExceptions($numinst: String!, $panel: String!,"
+                " $referenceId: String!, $counter: Int!, $suid: String) {\n"
+                "  xSGetExceptions(numinst: $numinst, panel: $panel,"
+                " referenceId: $referenceId, counter: $counter, suid: $suid) {\n"
+                "    res\n    msg\n"
+                "    exceptions {\n      status\n      deviceType\n      alias\n    }\n"
+                "  }\n}\n"
+            ),
+        }
+        response = await self._execute_request(content, "xSGetExceptions", installation)
+        data = response.get("data", {}).get("xSGetExceptions", {})
+        if data and data.get("res") == "OK":
+            return data.get("exceptions") or []
+        _LOGGER.warning("Failed to fetch arming exceptions: %s", data)
+        return []
 
     async def disarm_alarm(
         self, installation: Installation, command: str
@@ -796,17 +1095,16 @@ class ApiManager:
         await self._check_authentication_token()
         await self._check_capabilities_token(installation)
         response = await self._execute_request(content, "xSDisarmPanel", installation)
-        response = response["data"]["xSDisarmPanel"]
-        if response is None:
+        disarm_data = response["data"]["xSDisarmPanel"]
+        if disarm_data is None:
             raise SecuritasDirectError("Disarm response is None", response)
-        if "res" in response and response["res"] != "OK":
-            raise SecuritasDirectError(response["msg"], response)
+        if "res" in disarm_data and disarm_data["res"] != "OK":
+            raise SecuritasDirectError(disarm_data["msg"], response)
 
-        # Treat a missing or empty referenceId the same way: skip status polling.
-        # Some panels (e.g. Portugal) return res=OK but an empty referenceId,
-        # which causes every xSDisarmStatus call to respond with
-        # error_no_response_to_request — wasting 30 s and yielding no result.
-        reference_id = response.get("referenceId") or ""
+        # NOTE: Portugal (SDVECU panel) now returns a valid referenceId when the correct
+        # 'DARM1' command is used. The empty referenceId issue was caused by the incorrect
+        # 'DARM1DARMPERI' compound command (confirmed 2026-03-02).
+        reference_id = disarm_data.get("referenceId") or ""
 
         raw_data: dict[str, Any] = {}
         if reference_id:
@@ -908,7 +1206,10 @@ class ApiManager:
         }
         response = await self._execute_request(content, "DisarmStatus", installation)
 
-        return response["data"]["xSDisarmStatus"]
+        disarm_data = response["data"]["xSDisarmStatus"]
+        if disarm_data is None:
+            raise SecuritasDirectError("xSDisarmStatus response is None", response)
+        return disarm_data
 
     async def get_smart_lock_config(self, installation: Installation) -> SmartLock:
         content = {
@@ -916,13 +1217,21 @@ class ApiManager:
             "variables": {
                 "numinst": installation.number,
                 "panel": installation.panel,
-                "devices": [{"deviceType": "DR", "deviceId": "01", "keytype": "0"}]
-                },
+                "devices": [
+                    {
+                        "deviceType": SMARTLOCK_DEVICE_TYPE,
+                        "deviceId": SMARTLOCK_DEVICE_ID,
+                        "keytype": SMARTLOCK_KEY_TYPE,
+                    }
+                ],
+            },
             "query": "query xSGetSmartlockConfig($numinst: String!, $panel: String!, $devices: [SmartlockDevicesInfo]!) {\n  xSGetSmartlockConfig(numinst: $numinst, panel: $panel, devices: $devices) {\n    res\n    referenceId\n    zoneId\n    serialNumber\n    location\n    family\n    type\n    label\n    features {\n      holdBackLatchTime\n      calibrationType\n      autolock {\n        active\n        timeout\n      }\n    }\n  }\n}",
         }
         await self._check_authentication_token()
         await self._check_capabilities_token(installation)
-        response = await self._execute_request(content, "xSGetSmartlockConfig", installation)
+        response = await self._execute_request(
+            content, "xSGetSmartlockConfig", installation
+        )
 
         if "errors" in response:
             _LOGGER.error(response)
@@ -930,13 +1239,12 @@ class ApiManager:
 
         if "data" in response:
             raw_data = response["data"]["xSGetSmartlockConfig"]
-            return SmartLock(
-                raw_data["res"], 
-                raw_data["location"],
-                raw_data["type"])
+            if raw_data is None:
+                return SmartLock(None, None, None)
+            return SmartLock(raw_data["res"], raw_data["location"], raw_data["type"])
 
         return SmartLock(None, None, None)
-    
+
     async def get_lock_current_mode(self, installation: Installation) -> SmartLockMode:
         content = {
             "operationName": "xSGetLockCurrentMode",
@@ -947,7 +1255,9 @@ class ApiManager:
         }
         await self._check_authentication_token()
         await self._check_capabilities_token(installation)
-        response = await self._execute_request(content, "xSGetLockCurrentMode", installation)
+        response = await self._execute_request(
+            content, "xSGetLockCurrentMode", installation
+        )
 
         if "errors" in response:
             _LOGGER.error(response)
@@ -955,35 +1265,46 @@ class ApiManager:
 
         if "data" in response:
             raw_data = response["data"]["xSGetLockCurrentMode"]
-            return SmartLockMode(
-                raw_data["res"], 
-                raw_data["smartlockInfo"][0]["lockStatus"])
+            if raw_data is None:
+                return SmartLockMode(None, "0")
+            lock_status = "0"
+            if raw_data.get("smartlockInfo"):
+                lock_status = raw_data["smartlockInfo"][0]["lockStatus"]
+            return SmartLockMode(raw_data["res"], lock_status)
 
         return SmartLockMode(None, "0")
-    
-    async def change_lock_mode(self, installation: Installation, lock: bool) -> SmartLockModeStatus:
+
+    async def change_lock_mode(
+        self, installation: Installation, lock: bool
+    ) -> SmartLockModeStatus:
         content = {
             "operationName": "xSChangeSmartlockMode",
             "variables": {
                 "numinst": installation.number,
                 "panel": installation.panel,
-                "deviceType": "DR", 
-                "deviceId": "01", 
+                "deviceType": SMARTLOCK_DEVICE_TYPE,
+                "deviceId": SMARTLOCK_DEVICE_ID,
                 "lock": lock,
             },
             "query": "mutation xSChangeSmartlockMode($numinst: String!, $panel: String!, $deviceId: String!, $deviceType: String!, $lock: Boolean!) {\n  xSChangeSmartlockMode(\n    numinst: $numinst\n    panel: $panel\n    deviceId: $deviceId\n    deviceType: $deviceType\n    lock: $lock\n  ) {\n    res\n    msg\n    referenceId\n  }\n}",
         }
         await self._check_authentication_token()
         await self._check_capabilities_token(installation)
-        response = await self._execute_request(content, "xSChangeSmartlockMode", installation)
-        response = response["data"]["xSChangeSmartlockMode"]
-        if "res" in response and response["res"] != "OK":
-            raise SecuritasDirectError(response["msg"], response)
+        response = await self._execute_request(
+            content, "xSChangeSmartlockMode", installation
+        )
+        lock_data = response["data"]["xSChangeSmartlockMode"]
+        if lock_data is None:
+            raise SecuritasDirectError(
+                "xSChangeSmartlockMode response is None", response
+            )
+        if "res" in lock_data and lock_data["res"] != "OK":
+            raise SecuritasDirectError(lock_data["msg"], response)
 
-        if "referenceId" not in response or "res" not in response:
+        if "referenceId" not in lock_data or "res" not in lock_data:
             raise SecuritasDirectError("No referenceId in response", response)
 
-        reference_id = response["referenceId"]
+        reference_id = lock_data["referenceId"]
 
         count = 1
         raw_data: dict[str, Any] = {}
@@ -996,13 +1317,13 @@ class ApiManager:
             )
             count = count + 1
 
-        await asyncio.sleep(self.delay_check_operation*7)
+        await asyncio.sleep(self.delay_check_operation * LOCK_MODE_SETTLE_MULTIPLIER)
         self.protom_response = raw_data["protomResponse"]
         return SmartLockModeStatus(
             raw_data["res"],
             raw_data["msg"],
             raw_data["protomResponse"],
-            raw_data["status"]
+            raw_data["status"],
         )
 
     async def _check_change_lock_mode(
@@ -1015,13 +1336,20 @@ class ApiManager:
             "operationName": "xSChangeSmartlockModeStatus",
             "variables": {
                 "counter": counter,
-                "deviceId": "01",
+                "deviceId": SMARTLOCK_DEVICE_ID,
                 "numinst": installation.number,
                 "panel": installation.panel,
                 "referenceId": reference_id,
             },
             "query": "query xSChangeSmartlockModeStatus($numinst: String!, $panel: String!, $referenceId: String!, $deviceId: String, $counter: Int) {\n  xSChangeSmartlockModeStatus(\n    numinst: $numinst\n    panel: $panel\n    referenceId: $referenceId\n    counter: $counter\n    deviceId: $deviceId\n  ) {\n    res\n    msg\n    protomResponse\n    status\n  }\n}",
         }
-        response = await self._execute_request(content, "xSChangeSmartlockModeStatus", installation)
+        response = await self._execute_request(
+            content, "xSChangeSmartlockModeStatus", installation
+        )
 
-        return response["data"]["xSChangeSmartlockModeStatus"]
+        lock_status_data = response["data"]["xSChangeSmartlockModeStatus"]
+        if lock_status_data is None:
+            raise SecuritasDirectError(
+                "xSChangeSmartlockModeStatus response is None", response
+            )
+        return lock_status_data

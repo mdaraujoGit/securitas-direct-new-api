@@ -11,6 +11,7 @@
                     "use_2FA": "Use 2FA",
                     "country": "Country Code",
                     "code": "PIN Code (leave empty for no PIN)",
+                    "code_arm_required": "Also require PIN code (if any) to arm alarm",
                     "PERI_alarm": "Is there a Perimetral alarm?",
                     "check_alarm_panel": "Check alarm panel's status in every request",
                     "scan_interval": "Update scan interval (sec)",
@@ -34,10 +35,12 @@
             "init": {
                 "data": {
                     "code": "PIN Code (leave empty for no PIN)",
+                    "code_arm_required": "Also require PIN code (if any) to arm alarm",
                     "PERI_alarm": "Is there a Perimetral alarm?",
                     "check_alarm_panel": "Check alarm panel's status in every request (not recommended)",
                     "scan_interval": "Update scan interval (sec)",
-                    "delay_check_operation": "Delay to check the arming and disarming operation (sec)"
+                    "delay_check_operation": "Delay to check the arming and disarming operation (sec)",
+                    "notify_group": "Notify service for arming exceptions (e.g. mobile_app_phone)"
                 }
             },
             "mappings": {
@@ -50,6 +53,17 @@
                     "map_custom": "Custom"
                 }
             }
+        }
+    },
+    "services": {
+        "force_arm": {
+            "name": "Force arm",
+            "description": "Force-arm the alarm, overriding non-blocking exceptions (e.g. open windows) from a previous failed arm attempt."
+        }
+    },
+    "exceptions": {
+        "invalid_pin_code": {
+            "message": "Invalid PIN code for {entity_id}"
         }
     }
 }

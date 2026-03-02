@@ -5,14 +5,17 @@ from enum import StrEnum
 
 class CommandType(StrEnum):
     """Legacy command type enum - kept for migration from old config."""
+
     STD = "std"
     PERI = "peri"
 
 
 class SecuritasState(StrEnum):
     """Verisure alarm states - combinations of interior mode and perimeter."""
+
     NOT_USED = "not_used"
     DISARMED = "disarmed"
+    DISARMED_PERI = "disarmed_peri"
     PARTIAL_DAY = "partial_day"
     PARTIAL_NIGHT = "partial_night"
     TOTAL = "total"
@@ -24,7 +27,8 @@ class SecuritasState(StrEnum):
 
 # Map SecuritasState -> API arm command string
 STATE_TO_COMMAND: dict[SecuritasState, str] = {
-    SecuritasState.DISARMED: "DARM1DARMPERI",
+    SecuritasState.DISARMED: "DARM1",
+    SecuritasState.DISARMED_PERI: "DARM1DARMPERI",
     SecuritasState.PARTIAL_DAY: "ARMDAY1",
     SecuritasState.PARTIAL_NIGHT: "ARMNIGHT1",
     SecuritasState.TOTAL: "ARM1",
@@ -34,13 +38,22 @@ STATE_TO_COMMAND: dict[SecuritasState, str] = {
     SecuritasState.TOTAL_PERI: "ARM1PERI1",
 }
 
+# Proto response code for the disarmed state (handled separately from PROTO_TO_STATE
+# in alarm_control_panel.py because it applies unconditionally regardless of mapping)
+PROTO_DISARMED = "D"
+
+# Seconds to wait after triggering a status-check operation before polling the result
+ALARM_STATUS_POLL_DELAY: float = 1.0
+
 # Map protomResponse code -> SecuritasState
 PROTO_TO_STATE: dict[str, SecuritasState] = {
+    # Same as SecuritasState.SecuritasState.DISARMED_PERI but alarm_control_panel.py L.218 already handle the disarmed case without using this map
     "D": SecuritasState.DISARMED,
     "E": SecuritasState.PERI_ONLY,
     "P": SecuritasState.PARTIAL_DAY,
     "Q": SecuritasState.PARTIAL_NIGHT,
     "B": SecuritasState.PARTIAL_DAY_PERI,
+    "C": SecuritasState.PARTIAL_NIGHT_PERI,
     "T": SecuritasState.TOTAL,
     "A": SecuritasState.TOTAL_PERI,
 }
@@ -49,6 +62,7 @@ PROTO_TO_STATE: dict[str, SecuritasState] = {
 STATE_LABELS: dict[SecuritasState, str] = {
     SecuritasState.NOT_USED: "Not used",
     SecuritasState.DISARMED: "Disarmed",
+    SecuritasState.DISARMED_PERI: "Disarmed",
     SecuritasState.PARTIAL_DAY: "Partial Day",
     SecuritasState.PARTIAL_NIGHT: "Partial Night",
     SecuritasState.TOTAL: "Total",
@@ -61,7 +75,6 @@ STATE_LABELS: dict[SecuritasState, str] = {
 # Options available when perimeter is NOT configured
 STD_OPTIONS: list[SecuritasState] = [
     SecuritasState.NOT_USED,
-    SecuritasState.DISARMED,
     SecuritasState.PARTIAL_DAY,
     SecuritasState.PARTIAL_NIGHT,
     SecuritasState.TOTAL,
@@ -70,7 +83,6 @@ STD_OPTIONS: list[SecuritasState] = [
 # Options available when perimeter IS configured
 PERI_OPTIONS: list[SecuritasState] = [
     SecuritasState.NOT_USED,
-    SecuritasState.DISARMED,
     SecuritasState.PARTIAL_DAY,
     SecuritasState.PARTIAL_NIGHT,
     SecuritasState.TOTAL,
